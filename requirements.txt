@@ -1,0 +1,7 @@
+numpy
+
+plyfile
+scipy
+scikit-learn
+google-genai
+imageio[pyav]

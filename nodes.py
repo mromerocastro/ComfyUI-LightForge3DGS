@@ -10,7 +10,9 @@ class Load3DGS:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "ply_path": ("STRING", {"default": "input.ply"}),
+                "ply_path": ("STRING", {"default": ""}),
+                "force_recompute_normals": ("BOOLEAN", {"default": False}),
+                "normal_smoothing": ("INT", {"default": 30, "min": 5, "max": 100}),
             }
         }
 
@@ -19,11 +21,16 @@ class Load3DGS:
     FUNCTION = "load_model"
     CATEGORY = "LightForge3DGS"
 
-    def load_model(self, ply_path):
+    def load_model(self, ply_path, force_recompute_normals, normal_smoothing):
+        ply_path = ply_path.strip('"').strip("'")
+        
+        if not ply_path:
+            raise ValueError("Please enter a path to a .ply file")
+        
         if not os.path.exists(ply_path):
             raise FileNotFoundError(f"PLY file not found: {ply_path}")
         
-        model_data = LightForgeEngine.load_ply(ply_path)
+        model_data = LightForgeEngine.load_ply(ply_path, force_recompute=force_recompute_normals, k=normal_smoothing)
         return (model_data,)
 
 class Relight3DGS:
@@ -32,37 +39,54 @@ class Relight3DGS:
         return {
             "required": {
                 "model": ("GS_MODEL",),
-                "azimuth": ("FLOAT", {"default": 180.0, "min": 0.0, "max": 360.0}),
-                "elevation": ("FLOAT", {"default": 45.0, "min": 0.0, "max": 90.0}),
-                "intensity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0}),
-                "ambient": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0}),
-                "temperature": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0}),
-                "cluster_mask": ("INT", {"default": -1, "min": -1, "max": 100}), # -1 = All
+                "view_mode": (["Final", "Normals", "Light Map"], {"default": "Final"}),
+                "azimuth": ("FLOAT", {"default": 180.0, "min": 0.0, "max": 360.0, "step": 1.0, "display": "slider"}),
+                "elevation": ("FLOAT", {"default": 45.0, "min": 0.0, "max": 90.0, "step": 1.0, "display": "slider"}),
+                "intensity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.01, "display": "slider"}),
+                "ambient": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01, "display": "slider"}),
+                "temperature": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01, "display": "slider"}),
+                "global_brightness": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.1, "display": "slider"}),
             },
             "optional": {
-                "light_params": ("LIGHT_PARAMS",), # From Gemini
+                "light_params": ("LIGHT_PARAMS",),
             }
         }
 
-    RETURN_TYPES = ("GS_MODEL",)
-    RETURN_NAMES = ("relit_model",)
+    RETURN_TYPES = ("GS_MODEL", "STRING")
+    RETURN_NAMES = ("relit_model", "debug_info")
     FUNCTION = "relight"
     CATEGORY = "LightForge3DGS"
 
-    def relight(self, model, azimuth, elevation, intensity, ambient, temperature, cluster_mask=-1, light_params=None):
+    def relight(self, model, view_mode, azimuth, elevation, intensity, ambient, temperature, global_brightness, light_params=None):
         # Override with light_params if provided
         if light_params:
-            print(f"Using Gemini Light Params: {light_params}")
+            print(f"--- RELIGHT PARAMETERS (Gemini) ---")
+            print(f"Original from Gemini: {light_params}")
             azimuth = light_params.get("azimuth", azimuth)
             elevation = light_params.get("elevation", elevation)
             intensity = light_params.get("intensity", intensity)
             ambient = light_params.get("ambient", ambient)
             temperature = light_params.get("temperature", temperature)
-            
-        print(f"Relighting with: Az={azimuth}, El={elevation}, Int={intensity}, Amb={ambient}, Temp={temperature}, Cluster={cluster_mask}")
+        else:
+            print(f"--- RELIGHT PARAMETERS (Manual) ---")
+
+        # Apply Global Brightness
+        intensity *= global_brightness
         
-        new_model = LightForgeEngine.relight(model, azimuth, elevation, intensity, ambient, temperature, cluster_mask)
-        return (new_model,)
+        print(f"FINAL VALUES: Az={azimuth:.1f}, El={elevation:.1f}, Int={intensity:.2f}, Amb={ambient:.2f}, Temp={temperature:.1f}")
+        
+        new_model = LightForgeEngine.relight(model, azimuth, elevation, intensity, ambient, temperature, -1)
+        
+        # Check normals in debug
+        normals = model['normals']
+        if np.all(normals == 0):
+            normals_status = "WARNING: Normals are all ZERO. Relighting will be flat."
+        else:
+            normals_status = f"Normals present (Shape: {normals.shape})"
+            
+        debug_text = f"Status: {normals_status}\n\nUsed Parameters:\nAzimuth: {azimuth:.1f}\nElevation: {elevation:.1f}\nIntensity: {intensity:.2f} (x{global_brightness})\nAmbient: {ambient:.2f}\nTemperature: {temperature:.1f}"
+        
+        return (new_model, debug_text)
 
 class Segment3DGS:
     @classmethod
@@ -133,12 +157,12 @@ class GeminiLightExtractorNode:
             "required": {
                 "image": ("IMAGE",), # ComfyUI Image Tensor
                 "gemini_api_key": ("STRING", {"default": "", "multiline": False}),
-                "model_name": (["gemini-2.0-flash-exp", "gemini-1.5-pro", "gemini-1.5-flash"], {"default": "gemini-2.0-flash-exp"}),
+                "model_name": (["gemini-2.0-flash-exp", "gemini-1.5-flash", "gemini-1.5-pro"], {"default": "gemini-2.0-flash-exp"}),
             }
         }
 
-    RETURN_TYPES = ("LIGHT_PARAMS",)
-    RETURN_NAMES = ("light_params",)
+    RETURN_TYPES = ("LIGHT_PARAMS", "STRING")
+    RETURN_NAMES = ("light_params", "analysis_text")
     FUNCTION = "extract_light"
     CATEGORY = "LightForge3DGS"
 
@@ -156,92 +180,28 @@ class GeminiLightExtractorNode:
         extractor = GeminiLightExtractor(api_key=gemini_api_key, model_name=model_name)
         params = extractor.analyze(img)
         
-        return (params,)
-
-
-from .hdri_utils import HDRIAnalyzer
-
-class LoadHDRI:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "hdri_path": ("STRING", {"default": "input.hdr"}),
-            }
-        }
-
-    RETURN_TYPES = ("HDRI_PATH",)
-    RETURN_NAMES = ("hdri_path",)
-    FUNCTION = "load_hdri"
-    CATEGORY = "LightForge3DGS"
-
-    def load_hdri(self, hdri_path):
-        if not os.path.exists(hdri_path):
-            raise FileNotFoundError(f"HDRI file not found: {hdri_path}")
-        return (hdri_path,)
-
-class HDRILightExtractor:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "hdri_path": ("HDRI_PATH",),
-            }
-        }
-
-    RETURN_TYPES = ("LIGHT_PARAMS",)
-    RETURN_NAMES = ("light_params",)
-    FUNCTION = "extract_light"
-    CATEGORY = "LightForge3DGS"
-
-    def extract_light(self, hdri_path):
-        params = HDRIAnalyzer.load_and_analyze(hdri_path)
-        if params is None:
-            # Fallback
-            params = {
-                "azimuth": 180.0, "elevation": 45.0, "intensity": 1.0, "ambient": 0.2, "temperature": 0.0
-            }
-        return (params,)
-
-class GeminiImageGenerator:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "prompt": ("STRING", {"multiline": True, "default": "A sunset over the ocean, golden hour lighting"}),
-                "gemini_api_key": ("STRING", {"default": ""}),
-            }
-        }
-
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
-    FUNCTION = "generate"
-    CATEGORY = "LightForge3DGS"
-
-    def generate(self, prompt, gemini_api_key):
-        import numpy as np
-        import torch
+        # Create descriptive text
+        analysis_text = f"Gemini Analysis:\n"
+        analysis_text += f"- Azimuth: {params['azimuth']}°\n"
+        analysis_text += f"- Elevation: {params['elevation']}°\n"
+        analysis_text += f"- Intensity: {params['intensity']}\n"
+        analysis_text += f"- Ambient: {params['ambient']}\n"
+        analysis_text += f"- Temperature: {params['temperature']}\n"
         
-        extractor = GeminiLightExtractor(api_key=gemini_api_key)
-        pil_img = extractor.generate_image(prompt)
-        
-        if pil_img is None:
-            # Return black placeholder or error
-            return (torch.zeros((1, 512, 512, 3)),)
-            
-        # Convert PIL to Tensor [B, H, W, C]
-        img_np = np.array(pil_img).astype(np.float32) / 255.0
-        img_tensor = torch.from_numpy(img_np)[None,]
-        return (img_tensor,)
+        return (params, analysis_text)
+
+
+
+
+
+
 
 NODE_CLASS_MAPPINGS = {
     "Load3DGS": Load3DGS,
     "Relight3DGS": Relight3DGS,
     "Save3DGS": Save3DGS,
     "GeminiLightExtractor": GeminiLightExtractorNode,
-    "LoadHDRI": LoadHDRI,
-    "HDRILightExtractor": HDRILightExtractor,
-    "GeminiImageGenerator": GeminiImageGenerator,
+
     "Segment3DGS": Segment3DGS,
     "Analyze3DGS": Analyze3DGS
 }
@@ -251,9 +211,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Relight3DGS": "Relight 3DGS (Physical)",
     "Save3DGS": "Save 3DGS (.ply)",
     "GeminiLightExtractor": "Gemini 3 Light Extractor",
-    "LoadHDRI": "Load HDRI (.exr/.hdr)",
-    "HDRILightExtractor": "HDRI Light Extractor",
-    "GeminiImageGenerator": "Gemini 3 Image Generator (Nano Banana)",
+
     "Segment3DGS": "Segment 3DGS (K-Means)",
     "Analyze3DGS": "Analyze 3DGS Info"
 }

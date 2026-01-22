@@ -7,21 +7,31 @@ LightForge 3DGS is a ComfyUI Custom Node that allows you to physically relight 3
 Project for Google DeepMind Hackathon.
 
 ## Features
-- **Gemini 3 Integration**: Analyze reference images to extract realistic lighting parameters (Azimuth, Elevation, Intensity, Temperature).
-- **Nano Banana (Imagen 3)**: Generate reference lighting environments from text prompts directly in ComfyUI.
-- **HDRI Support**: Extract dominant light sources from `.exr` and `.hdr` files.
-- **Segmentation**: Spatially cluster the model to relight specific parts (e.g., separate objects).
 - **Physical Relighting**: Modifies Spherical Harmonics (SH) coefficients of the 3DGS model to match the new lighting.
-- **Normal Computation**: Automatically computes normals if missing from the PLY.
+- **Robust Normal Computation**: Automatically computes normals if missing or invalid (using SciPy/PCA).
+- **Gemini 3 Integration**: Analyze reference images to extract realistic lighting parameters.
+- **Drag & Drop**: Load models easily from the ComfyUI input folder or absolute paths.
 
 ## Installation
 
-1. Copy the `ComfyUI-LightForge3DGS` folder to your `ComfyUI/custom_nodes/` directory.
-2. Install dependencies:
-   ```bash
-   pip install google-genai plyfile numpy open3d imageio[pyav] scikit-learn
-   ```
-3. Restart ComfyUI.
+1.  **Navigate to your ComfyUI custom nodes directory**:
+    ```bash
+    cd ComfyUI/custom_nodes/
+    ```
+
+2.  **Clone this repository**:
+    ```bash
+    git clone https://github.com/mromerocastro/ComfyUI-LightForge3DGS.git
+    ```
+
+3.  **Install Dependencies**:
+    Go to the `ComfyUI-LightForge3DGS` folder and install the requirements.
+    ```bash
+    cd ComfyUI-LightForge3DGS
+    pip install -r requirements.txt
+    ```
+    *Note: If you are using the ComfyUI Portable version, make sure to use the embedded python (e.g., `..\..\python_embeded\python.exe -m pip install -r requirements.txt`).*
+
 
 ## Nodes
 
@@ -45,32 +55,26 @@ Uses Gemini 3 Vision to analyze an image and estimate lighting.
 - **Input**: Image (from Load Image or Generator), API Key.
 - **Output**: LIGHT_PARAMS.
 
-### 5. Gemini 3 Image Generator (Nano Banana)
-Generates a reference image using Gemini/Imagen 3.
-- **Input**: Prompt, API Key.
-- **Output**: IMAGE.
+### 5. Relight 3DGS (Physical)
+Applies the lighting parameters to the model. 
+**Behavior**:
+- **Automatic**: Connect the `LIGHT_PARAMS` output from Gemini Extractor to the `light_params` input.
+- **Manual**: Use the sliders (Azimuth, Elevation, etc.).
+- **Visuals**: Check the **Preview Widget** (visual light) and the **Debug Info** output (text).
 
-### 6. HDRI Light Extractor
-Analyzes an HDRI map to find the sun position.
-- **Input**: HDRI Path.
-- **Output**: LIGHT_PARAMS.
+- **Input**: GS_MODEL, LIGHT_PARAMS (optional), Manual Overrides.
+- **Output**: GS_MODEL (Relit), DEBUG_INFO (String).
 
-### 7. Relight 3DGS (Physical)
-Applies the lighting parameters to the model. Can limit to specific cluster.
-- **Input**: GS_MODEL, LIGHT_PARAMS (optional), Manual Overrides, Cluster Mask.
-- **Output**: GS_MODEL (Relit).
-
-### 8. Save 3DGS (.ply)
+### 6. Save 3DGS (.ply)
 Saves the modified model.
 - **Input**: GS_MODEL.
 - **Output**: File Path.
 
 ## Example Workflows
 
-Included in this folder are JSON files you can drag and drop into ComfyUI:
+Included in this folder is an example JSON file:
 
-1.  **`workflow_text_to_relight.json`**: Uses Gemini (Nano Banana) to generate a reference image from text ("Cyberpunk city", "Sunset", etc.) and applies that lighting to your model.
-2.  **`workflow_hdri_relight.json`**: Loads an HDRI file, extracts the sun position, and relights the model.
+1.  **`workflow_ai_relight.json`**: (Create this yourself easily) `Load 3DGS` + `Load Image` nodes -> `Gemini Extractor` -> `Relight 3DGS`.
 
 **How to use:**
 1. Open ComfyUI.

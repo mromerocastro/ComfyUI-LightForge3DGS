@@ -1,12 +1,12 @@
 
 import numpy as np
-import open3d as o3d
+
 from plyfile import PlyData, PlyElement
 import os
 
 class LightForgeEngine:
     @staticmethod
-    def load_ply(file_path):
+    def load_ply(file_path, force_recompute=False, k=30):
         """
         Loads a 3DGS PLY file and returns a dictionary with numpy arrays.
         """
@@ -26,37 +26,116 @@ class LightForgeEngine:
             colors_sh = np.zeros_like(positions)
 
         # Check for normals (nx, ny, nz)
-        if 'nx' in vertex and 'ny' in vertex and 'nz' in vertex:
-            normals = np.stack([vertex['nx'], vertex['ny'], vertex['nz']], axis=-1)
-        else:
-            print("Normals not found in PLY. Computing...")
-            normals = LightForgeEngine.compute_normals(positions)
-            
+        normals = None
+        
+        # If not forcing recompute, try loading from file
+        if not force_recompute:
+            if 'nx' in vertex and 'ny' in vertex and 'nz' in vertex:
+                normals = np.stack([vertex['nx'], vertex['ny'], vertex['nz']], axis=-1)
+                if np.all(normals == 0):
+                   print("WARNING: PLY normals are ZERO. Recomputing...")
+                   normals = None # Trigger recompute logic
+            else:
+                print("Normals not found in PLY.")
+
+        # If data struct prepared, check for sidecar cache (only if not forcing)
+        # Note: We build the dict later, but we need normals now or later.
+        
+        # ... Wait, the cache loading logic is currently AFTER dict creation. 
+        # I need to restructure slightly to prioritize Cache -> File -> Compute.
+        
         data = {
-            'plydata': plydata, # Keep original for metadata
+            'plydata': plydata, 
             'positions': positions,
-            'normals': normals,
+            'normals': np.zeros_like(positions), # placeholder
             'colors_sh': colors_sh,
-            'vertex_data': vertex.data # Keep raw data for saving
+            'vertex_data': vertex.data
         }
+        
+        # Check Cache FIRST if not forcing
+        loaded_from_cache = False
+        if not force_recompute:
+            base_dir = os.path.dirname(file_path)
+            filename = os.path.basename(file_path)
+            name_no_ext = os.path.splitext(filename)[0]
+            candidates = [
+                os.path.join(base_dir, f"{name_no_ext}.npz"),
+                os.path.join(base_dir, "segmentation_cache_with_normals.npz"),
+                os.path.join(base_dir, "segmentation_cache.npz")
+            ]
+            for npz_path in candidates:
+                if os.path.exists(npz_path):
+                    try:
+                        print(f"Found cache file: {npz_path}")
+                        cache = np.load(npz_path)
+                        if len(cache['positions']) == len(positions):
+                            print("✅ Cache matches PLY! Loading...")
+                            if 'normals' in cache:
+                                data['normals'] = cache['normals']
+                                loaded_from_cache = True
+                            if 'labels' in cache:
+                                data['labels'] = cache['labels']
+                            break
+                    except Exception: pass
+        
+        # If no cache and (no file normals OR forcing), COMPUTE
+        if not loaded_from_cache:
+            if normals is not None and not force_recompute:
+                data['normals'] = normals # Use file normals
+            else:
+                print(f"Computing normals (k={k})...")
+                data['normals'] = LightForgeEngine.compute_normals(positions, k=k)
+
         return data
 
     @staticmethod
-    def compute_normals(positions):
+    def compute_normals(positions, k=30):
         """
-        Computes normals using Open3D from position data.
+        Computes normals using PCA via scikit-learn and numpy.
         """
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(positions)
+        try:
+            import scipy.spatial
+        except ImportError:
+            print("scipy not found. Cannot compute normals. Please install scipy.")
+            return np.zeros_like(positions)
+
+        print(f"Computing normals using PCA (via SciPy) k={k}...")
         
-        # Estimate normals
-        pcd.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(
-                radius=0.1, max_nn=30
-            )
-        )
-        pcd.orient_normals_consistent_tangent_plane(k=15)
-        return np.asarray(pcd.normals)
+        # Find neighbors using SciPy KDTree (more standard in ComfyUI envs)
+        tree = scipy.spatial.KDTree(positions)
+        # query returns values, indices
+        _, indices = tree.query(positions, k=k)
+        
+        # Gather neighborhoods: (N, k, 3)
+        neighborhoods = positions[indices]
+        
+        # Center the neighborhoods
+        means = np.mean(neighborhoods, axis=1, keepdims=True)
+        centered = neighborhoods - means
+        
+        # Compute variances (N, 3, 3)
+        # matrix multiplication of (3, k) * (k, 3) for each point
+        covariances = np.matmul(centered.transpose(0, 2, 1), centered)
+        
+        # Eigen decomposition
+        # eigh is for symmetric matrices. Returns eigenvalues (ascending) and eigenvectors.
+        # The column v[:, i] is the eigenvector for w[i].
+        # We want the eigenvector for the smallest eigenvalue (index 0).
+        _, evecs = np.linalg.eigh(covariances)
+        estimated_normals = evecs[:, :, 0]
+        
+        # Orientation consistency heuristic: Orient away from object centroid
+        object_centroid = np.mean(positions, axis=0)
+        view_dirs = positions - object_centroid
+        
+        # Dot product to check alignment
+        dots = np.sum(estimated_normals * view_dirs, axis=1)
+        
+        # Flip where dot product is negative (pointing inwards)
+        flip_mask = dots < 0
+        estimated_normals[flip_mask] = -estimated_normals[flip_mask]
+        
+        return estimated_normals
 
     @staticmethod
     def sh_to_rgb(sh_dc):
@@ -131,7 +210,7 @@ class LightForgeEngine:
         return new_data
 
     @staticmethod
-    def relight(data, azimuth, elevation, intensity, ambient, temp, cluster_mask=-1):
+    def relight(data, azimuth, elevation, intensity, ambient, temp, cluster_mask=-1, view_mode="Final"):
         """
         Applies directional lighting to 3DGS data.
         If cluster_mask >= 0 and 'labels' in data, only relights that cluster.
@@ -179,8 +258,24 @@ class LightForgeEngine:
                 rgb_lit[:, 1] *= (1 + temp * 0.1)
                 rgb_lit[:, 2] *= (1 - temp * 0.2)
         
-        rgb_lit = np.clip(rgb_lit, 0, 1)
-        new_sh_all = LightForgeEngine.rgb_to_sh(rgb_lit)
+        # Helper to convert Normals to RGB (0..1)
+        if view_mode == "Normals":
+            # Map [-1, 1] -> [0, 1]
+            rgb_vis = (normals_norm + 1.0) * 0.5
+            new_sh_all = LightForgeEngine.rgb_to_sh(rgb_vis)
+        
+        elif view_mode == "Light Map":
+            # Visualize lighting factor as grayscale
+            # Normalize factor for visualization (approx)
+            fact_vis = lighting_factor / max(intensity + 0.001, 1.0) 
+            fact_vis = np.clip(fact_vis, 0, 1)
+            rgb_vis = np.hstack([fact_vis, fact_vis, fact_vis])
+            new_sh_all = LightForgeEngine.rgb_to_sh(rgb_vis)
+            
+        else:
+            # Final Mode
+            rgb_lit = np.clip(rgb_lit, 0, 1)
+            new_sh_all = LightForgeEngine.rgb_to_sh(rgb_lit)
         
         # Apply Masking
         if cluster_mask >= 0 and labels is not None:
