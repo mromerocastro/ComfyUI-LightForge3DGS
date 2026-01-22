@@ -2,6 +2,7 @@
 import os
 import folder_paths
 import numpy as np
+import torch
 from .lighting_engine import LightForgeEngine
 from .gemini_light_extractor import GeminiLightExtractor
 
@@ -45,48 +46,72 @@ class Relight3DGS:
                 "intensity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.01, "display": "slider"}),
                 "ambient": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01, "display": "slider"}),
                 "temperature": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01, "display": "slider"}),
-                "global_brightness": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.1, "display": "slider"}),
-            },
-            "optional": {
-                "light_params": ("LIGHT_PARAMS",),
             }
         }
 
-    RETURN_TYPES = ("GS_MODEL", "STRING")
-    RETURN_NAMES = ("relit_model", "debug_info")
-    FUNCTION = "relight"
+    RETURN_TYPES = ("GS_MODEL", "STRING", "IMAGE")
+    RETURN_NAMES = ("relit_model", "debug_info", "preview_image")
+    FUNCTION = "relight_manual"
     CATEGORY = "LightForge3DGS"
 
-    def relight(self, model, view_mode, azimuth, elevation, intensity, ambient, temperature, global_brightness, light_params=None):
-        # Override with light_params if provided
-        if light_params:
-            print(f"--- RELIGHT PARAMETERS (Gemini) ---")
-            print(f"Original from Gemini: {light_params}")
-            azimuth = light_params.get("azimuth", azimuth)
-            elevation = light_params.get("elevation", elevation)
-            intensity = light_params.get("intensity", intensity)
-            ambient = light_params.get("ambient", ambient)
-            temperature = light_params.get("temperature", temperature)
-        else:
-            print(f"--- RELIGHT PARAMETERS (Manual) ---")
-
-        # Apply Global Brightness
-        intensity *= global_brightness
+    def relight_manual(self, model, view_mode, azimuth, elevation, intensity, ambient, temperature):
+        # Direct pass to engine
+        new_model = LightForgeEngine.relight(
+            model, azimuth, elevation, intensity, ambient, temperature, 
+            cluster_mask=-1, view_mode=view_mode
+        )
         
-        print(f"FINAL VALUES: Az={azimuth:.1f}, El={elevation:.1f}, Int={intensity:.2f}, Amb={ambient:.2f}, Temp={temperature:.1f}")
-        
-        new_model = LightForgeEngine.relight(model, azimuth, elevation, intensity, ambient, temperature, -1)
-        
-        # Check normals in debug
+        # Debug Info
         normals = model['normals']
-        if np.all(normals == 0):
-            normals_status = "WARNING: Normals are all ZERO. Relighting will be flat."
-        else:
-            normals_status = f"Normals present (Shape: {normals.shape})"
-            
-        debug_text = f"Status: {normals_status}\n\nUsed Parameters:\nAzimuth: {azimuth:.1f}\nElevation: {elevation:.1f}\nIntensity: {intensity:.2f} (x{global_brightness})\nAmbient: {ambient:.2f}\nTemperature: {temperature:.1f}"
+        status = "Normals present" if not np.all(normals == 0) else "WARNING: Zero Normals"
+        debug_text = f"Mode: Manual\nStatus: {status}\nParams:\nAz: {azimuth}\nEl: {elevation}\nInt: {intensity}\nAmb: {ambient}\nTemp: {temperature}"
         
-        return (new_model, debug_text)
+        # Preview
+        preview_np = LightForgeEngine.generate_preview(azimuth, elevation, intensity, ambient, temperature)
+        preview_tensor = torch.from_numpy(preview_np).float().unsqueeze(0)
+
+        return (new_model, debug_text, preview_tensor)
+
+class Relight3DGS_Auto:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("GS_MODEL",),
+                "light_params": ("LIGHT_PARAMS",),
+                "view_mode": (["Final", "Normals", "Light Map"], {"default": "Final"}),
+                # Optional overrides (modifiers) could be added here later if requested, 
+                # but let's keep it clean as requested.
+                "global_brightness": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 5.0, "step": 0.1}),
+            }
+        }
+
+    RETURN_TYPES = ("GS_MODEL", "STRING", "IMAGE")
+    RETURN_NAMES = ("relit_model", "debug_info", "preview_image")
+    FUNCTION = "relight_auto"
+    CATEGORY = "LightForge3DGS"
+
+    def relight_auto(self, model, light_params, view_mode, global_brightness):
+        # Extract from Gemini params
+        az = light_params.get("azimuth", 180.0)
+        el = light_params.get("elevation", 45.0)
+        intensity = light_params.get("intensity", 1.0) * global_brightness
+        amb = light_params.get("ambient", 0.2)
+        temp = light_params.get("temperature", 0.0)
+        
+        new_model = LightForgeEngine.relight(
+            model, az, el, intensity, amb, temp, 
+            cluster_mask=-1, view_mode=view_mode
+        )
+        
+        normals = model['normals']
+        status = "Normals present" if not np.all(normals == 0) else "WARNING: Zero Normals"
+        debug_text = f"Mode: Auto (Gemini)\nStatus: {status}\nRaw Params:\n{light_params}\n\nUsed:\nAz: {az}\nEl: {el}\nInt: {intensity}\nAmb: {amb}\nTemp: {temp}"
+        
+        preview_np = LightForgeEngine.generate_preview(az, el, intensity, amb, temp)
+        preview_tensor = torch.from_numpy(preview_np).float().unsqueeze(0)
+
+        return (new_model, debug_text, preview_tensor)
 
 class Segment3DGS:
     @classmethod
@@ -199,6 +224,7 @@ class GeminiLightExtractorNode:
 NODE_CLASS_MAPPINGS = {
     "Load3DGS": Load3DGS,
     "Relight3DGS": Relight3DGS,
+    "Relight3DGS_Auto": Relight3DGS_Auto,
     "Save3DGS": Save3DGS,
     "GeminiLightExtractor": GeminiLightExtractorNode,
 
@@ -209,6 +235,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Load3DGS": "Load 3DGS (.ply)",
     "Relight3DGS": "Relight 3DGS (Physical)",
+    "Relight3DGS_Auto": "Relight 3DGS (Auto / Gemini)",
     "Save3DGS": "Save 3DGS (.ply)",
     "GeminiLightExtractor": "Gemini 3 Light Extractor",
 

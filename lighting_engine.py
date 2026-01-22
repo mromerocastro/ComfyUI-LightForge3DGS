@@ -323,3 +323,64 @@ class LightForgeEngine:
         vertex_element = PlyElement.describe(params_vertex_data, 'vertex')
         PlyData([vertex_element], text=False).write(output_path)
         return output_path
+
+    @staticmethod
+    def generate_preview(azimuth, elevation, intensity, ambient, temperature, size=512):
+        """
+        Generates a preview image of a sphere with the applied lighting.
+        Returns a numpy array (H, W, 3) normalized 0-1.
+        """
+        # Create a grid
+        x = np.linspace(-1, 1, size)
+        y = np.linspace(1, -1, size) # Flip Y to match image coords top-down
+        xv, yv = np.meshgrid(x, y)
+        
+        # Define sphere mask: r^2 = x^2 + y^2
+        r2 = xv**2 + yv**2
+        mask = r2 <= 1.0
+        
+        # Calculate normals for the sphere: z = sqrt(1 - r^2)
+        z = np.zeros_like(xv)
+        z[mask] = np.sqrt(1.0 - r2[mask])
+        
+        # Normals grid: (Size, Size, 3)
+        normals = np.zeros((size, size, 3))
+        normals[:, :, 0] = xv
+        normals[:, :, 1] = yv
+        normals[:, :, 2] = z
+        
+        # Light Direction
+        sun_dir = LightForgeEngine.spherical_to_cartesian(azimuth, elevation)
+        
+        # Flatten for calculation
+        n_flat = normals.reshape(-1, 3)
+        
+        # Compute Dot Product
+        dot = np.dot(n_flat, sun_dir)
+        diffuse = np.maximum(0, dot)
+        
+        # Calculate Lighting Factor
+        lighting_factor = ambient + (1.0 - ambient) * intensity * diffuse
+        lighting_factor = lighting_factor.reshape(size, size, 1)
+        
+        # Base Color (White Sphere)
+        rgb = np.ones((size, size, 3)) * lighting_factor
+        
+        # Apply Temperature (shared logic)
+        if abs(temperature) > 0.01:
+            if temperature > 0:  # Warm
+                rgb[:, :, 0] *= (1 + temperature * 0.2)
+                rgb[:, :, 1] *= (1 + temperature * 0.1)
+                rgb[:, :, 2] *= (1 - temperature * 0.15)
+            else:  # Cool
+                rgb[:, :, 0] *= (1 + temperature * 0.15)
+                rgb[:, :, 1] *= (1 + temperature * 0.1)
+                rgb[:, :, 2] *= (1 - temperature * 0.2)
+                
+        # Mask background to black
+        rgb[~mask] = 0.0
+        
+        # Clip to valid range
+        rgb = np.clip(rgb, 0, 1)
+        
+        return rgb
