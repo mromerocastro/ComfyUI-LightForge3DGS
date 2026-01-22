@@ -44,8 +44,15 @@ class Relight3DGS:
                 "azimuth": ("FLOAT", {"default": 180.0, "min": 0.0, "max": 360.0, "step": 1.0, "display": "slider"}),
                 "elevation": ("FLOAT", {"default": 45.0, "min": 0.0, "max": 90.0, "step": 1.0, "display": "slider"}),
                 "intensity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.01, "display": "slider"}),
-                "ambient": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01, "display": "slider"}),
+                "ambient": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01, "display": "slider"}),
                 "temperature": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01, "display": "slider"}),
+                "specular_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "display": "slider"}),
+                "roughness": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "display": "slider"}),
+                "shininess": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 100.0, "step": 1.0, "display": "slider"}),
+                "two_sided": ("BOOLEAN", {"default": True}),
+                "wrap_lighting": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01, "display": "slider"}),
+                "enable_hemisphere": ("BOOLEAN", {"default": False}),
+                "shadow_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "display": "slider"}),
             }
         }
 
@@ -54,20 +61,33 @@ class Relight3DGS:
     FUNCTION = "relight_manual"
     CATEGORY = "LightForge3DGS"
 
-    def relight_manual(self, model, view_mode, azimuth, elevation, intensity, ambient, temperature):
-        # Direct pass to engine
+    def relight_manual(self, model, view_mode, azimuth, elevation, intensity, ambient, temperature, 
+                       specular_strength, roughness, shininess, two_sided, wrap_lighting, 
+                       enable_hemisphere, shadow_strength):
+        # Prepare hemisphere colors if enabled
+        sky_color = np.array([0.53, 0.81, 0.92]) if enable_hemisphere else None  # Light blue
+        ground_color = np.array([0.24, 0.15, 0.09]) if enable_hemisphere else None  # Brown
+        
+        # Direct pass to engine with new parameters
         new_model = LightForgeEngine.relight(
             model, azimuth, elevation, intensity, ambient, temperature, 
-            cluster_mask=-1, view_mode=view_mode
+            cluster_mask=-1, view_mode=view_mode,
+            specular_strength=specular_strength, shininess=shininess,
+            two_sided=two_sided,
+            roughness=roughness,
+            sky_color=sky_color,
+            ground_color=ground_color,
+            wrap_lighting=wrap_lighting,
+            shadow_strength=shadow_strength
         )
         
         # Debug Info
         normals = model['normals']
         status = "Normals present" if not np.all(normals == 0) else "WARNING: Zero Normals"
-        debug_text = f"Mode: Manual\nStatus: {status}\nParams:\nAz: {azimuth}\nEl: {elevation}\nInt: {intensity}\nAmb: {ambient}\nTemp: {temperature}"
+        debug_text = f"Mode: Manual\nStatus: {status}\nParams:\nAz: {azimuth}\nEl: {elevation}\nInt: {intensity}\nAmb: {ambient}\nTemp: {temperature}\nSpecular: {specular_strength}\nShininess: {shininess}"
         
         # Preview
-        preview_np = LightForgeEngine.generate_preview(azimuth, elevation, intensity, ambient, temperature)
+        preview_np = LightForgeEngine.generate_preview(azimuth, elevation, intensity, ambient, temperature, specular_strength, shininess)
         preview_tensor = torch.from_numpy(preview_np).float().unsqueeze(0)
 
         return (new_model, debug_text, preview_tensor)
@@ -83,6 +103,7 @@ class Relight3DGS_Auto:
                 # Optional overrides (modifiers) could be added here later if requested, 
                 # but let's keep it clean as requested.
                 "global_brightness": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 5.0, "step": 0.1}),
+                "two_sided": ("BOOLEAN", {"default": True}),
             }
         }
 
@@ -91,7 +112,7 @@ class Relight3DGS_Auto:
     FUNCTION = "relight_auto"
     CATEGORY = "LightForge3DGS"
 
-    def relight_auto(self, model, light_params, view_mode, global_brightness):
+    def relight_auto(self, model, light_params, view_mode, global_brightness, two_sided):
         # Extract from Gemini params
         az = light_params.get("azimuth", 180.0)
         el = light_params.get("elevation", 45.0)
@@ -101,7 +122,8 @@ class Relight3DGS_Auto:
         
         new_model = LightForgeEngine.relight(
             model, az, el, intensity, amb, temp, 
-            cluster_mask=-1, view_mode=view_mode
+            cluster_mask=-1, view_mode=view_mode,
+            two_sided=two_sided
         )
         
         normals = model['normals']

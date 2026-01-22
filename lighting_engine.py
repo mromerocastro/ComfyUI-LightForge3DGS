@@ -91,7 +91,8 @@ class LightForgeEngine:
     @staticmethod
     def compute_normals(positions, k=30):
         """
-        Computes normals using PCA via scikit-learn and numpy.
+        Computes normals using PCA with robust multi-strategy orientation.
+        Includes validation, neighbor consistency, and degenerate normal handling.
         """
         try:
             import scipy.spatial
@@ -99,11 +100,11 @@ class LightForgeEngine:
             print("scipy not found. Cannot compute normals. Please install scipy.")
             return np.zeros_like(positions)
 
-        print(f"Computing normals using PCA (via SciPy) k={k}...")
+        print(f"Computing normals using Enhanced PCA (k={k})...")
+        eps = 1e-8  # Epsilon for numerical stability
         
-        # Find neighbors using SciPy KDTree (more standard in ComfyUI envs)
+        # Find neighbors using SciPy KDTree
         tree = scipy.spatial.KDTree(positions)
-        # query returns values, indices
         _, indices = tree.query(positions, k=k)
         
         # Gather neighborhoods: (N, k, 3)
@@ -113,29 +114,76 @@ class LightForgeEngine:
         means = np.mean(neighborhoods, axis=1, keepdims=True)
         centered = neighborhoods - means
         
-        # Compute variances (N, 3, 3)
-        # matrix multiplication of (3, k) * (k, 3) for each point
+        # Compute covariances (N, 3, 3)
         covariances = np.matmul(centered.transpose(0, 2, 1), centered)
         
-        # Eigen decomposition
-        # eigh is for symmetric matrices. Returns eigenvalues (ascending) and eigenvectors.
-        # The column v[:, i] is the eigenvector for w[i].
-        # We want the eigenvector for the smallest eigenvalue (index 0).
-        _, evecs = np.linalg.eigh(covariances)
+        # Eigen decomposition - smallest eigenvalue = normal direction
+        eigenvalues, evecs = np.linalg.eigh(covariances)
         estimated_normals = evecs[:, :, 0]
         
-        # Orientation consistency heuristic: Orient away from object centroid
+        # === ROBUST NORMALIZATION ===
+        # Ensure normals are unit length
+        norm_lengths = np.linalg.norm(estimated_normals, axis=1, keepdims=True)
+        norm_lengths = np.where(norm_lengths < eps, 1.0, norm_lengths)
+        estimated_normals = estimated_normals / norm_lengths
+        
+        # Detect and mark degenerate normals (zero or NaN)
+        degenerate_mask = (norm_lengths.squeeze() < eps) | np.isnan(estimated_normals).any(axis=1)
+        if degenerate_mask.any():
+            print(f"⚠️  Found {degenerate_mask.sum()} degenerate normals, setting to up vector")
+            estimated_normals[degenerate_mask] = np.array([0.0, 1.0, 0.0])
+        
+        # === STRATEGY 1: Orient away from object centroid ===
         object_centroid = np.mean(positions, axis=0)
         view_dirs = positions - object_centroid
+        view_dirs_norm = view_dirs / (np.linalg.norm(view_dirs, axis=1, keepdims=True) + eps)
         
-        # Dot product to check alignment
-        dots = np.sum(estimated_normals * view_dirs, axis=1)
+        dots = np.sum(estimated_normals * view_dirs_norm, axis=1)
+        flip_mask_centroid = dots < 0
         
-        # Flip where dot product is negative (pointing inwards)
-        flip_mask = dots < 0
+        # === STRATEGY 2: Neighbor consistency voting ===
+        # For each point, check if neighbors agree on orientation
+        # Use k_vote smaller than k to avoid over-smoothing
+        k_vote = min(10, k // 3)
+        neighbor_normals = estimated_normals[indices[:, :k_vote]]
+        
+        # Compute average dot product with neighbors
+        self_normals_expanded = estimated_normals[:, np.newaxis, :]
+        neighbor_dots = np.sum(neighbor_normals * self_normals_expanded, axis=2)
+        avg_neighbor_agreement = np.mean(neighbor_dots, axis=1)
+        
+        # If most neighbors disagree (avg < 0), flip
+        flip_mask_neighbors = avg_neighbor_agreement < -0.1
+        
+        # === STRATEGY 3: Combined voting ===
+        # Flip if BOTH strategies suggest flipping (more conservative)
+        # OR if eigenvalue planarity is low (ambiguous cases)
+        planarity = (eigenvalues[:, 1] - eigenvalues[:, 0]) / (eigenvalues[:, 2] + eps)
+        low_confidence = planarity < 0.1
+        
+        # Combined flipping logic
+        flip_mask = flip_mask_centroid.copy()
+        flip_mask = flip_mask | (flip_mask_neighbors & low_confidence)
+        
         estimated_normals[flip_mask] = -estimated_normals[flip_mask]
         
+        # === FINAL VALIDATION ===
+        # One more pass to ensure no degenerates slipped through
+        final_lengths = np.linalg.norm(estimated_normals, axis=1)
+        invalid_mask = (final_lengths < 0.9) | (final_lengths > 1.1) | np.isnan(estimated_normals).any(axis=1)
+        if invalid_mask.any():
+            print(f"⚠️  Correcting {invalid_mask.sum()} invalid normals in final pass")
+            estimated_normals[invalid_mask] = np.array([0.0, 1.0, 0.0])
+            norm_lengths = np.linalg.norm(estimated_normals, axis=1, keepdims=True)
+            estimated_normals = estimated_normals / (norm_lengths + eps)
+        
+        # === DIAGNOSTICS ===
+        flipped_pct = (flip_mask.sum() / len(flip_mask)) * 100
+        degenerate_pct = (degenerate_mask.sum() / len(degenerate_mask)) * 100
+        print(f"✓ Normals computed: {flipped_pct:.1f}% flipped, {degenerate_pct:.2f}% degenerate")
+        
         return estimated_normals
+
 
     @staticmethod
     def sh_to_rgb(sh_dc):
@@ -210,44 +258,173 @@ class LightForgeEngine:
         return new_data
 
     @staticmethod
-    def relight(data, azimuth, elevation, intensity, ambient, temp, cluster_mask=-1, view_mode="Final"):
+    def _ggx_specular(normals, light_dir, view_dir, roughness, specular_strength):
         """
-        Applies directional lighting to 3DGS data.
-        If cluster_mask >= 0 and 'labels' in data, only relights that cluster.
+        GGX/Cook-Torrance microfacet BRDF for more realistic specular highlights.
+        Based on physically-based rendering (PBR) principles.
         """
+        eps = 1e-8
+        
+        # Half vector
+        half_vector = light_dir + view_dir
+        half_vector = half_vector / (np.linalg.norm(half_vector) + eps)
+        
+        # Dot products
+        n_dot_h = np.maximum(0, np.dot(normals, half_vector))
+        n_dot_v = np.maximum(0, np.dot(normals, view_dir))
+        n_dot_l = np.maximum(0, np.dot(normals, light_dir))
+        
+        # GGX Normal Distribution Function (D)
+        alpha = roughness * roughness
+        alpha2 = alpha * alpha
+        denom = (n_dot_h * n_dot_h * (alpha2 - 1.0) + 1.0)
+        D = alpha2 / (np.pi * denom * denom + eps)
+        
+        # Geometry term (simplified Schlick-GGX)
+        k = alpha / 2.0
+        G1_v = n_dot_v / (n_dot_v * (1.0 - k) + k + eps)
+        G1_l = n_dot_l / (n_dot_l * (1.0 - k) + k + eps)
+        G = G1_v * G1_l
+        
+        # Fresnel (simplified Schlick approximation, assume F0 = 0.04 for dielectrics)
+        F0 = 0.04
+        F = F0 + (1.0 - F0) * np.power(1.0 - n_dot_h, 5.0)
+        
+        # Cook-Torrance specular BRDF
+        specular = (D * G * F) / (4.0 * n_dot_v * n_dot_l + eps)
+        specular = specular * specular_strength
+        
+        return specular
+    
+    @staticmethod
+    def relight(data, azimuth, elevation, intensity, ambient, temp, cluster_mask=-1, view_mode="Final", 
+                specular_strength=0.0, shininess=30.0, two_sided=True, 
+                roughness=0.5, sky_color=None, ground_color=None, wrap_lighting=0.0, shadow_strength=0.0):
+        """
+        Enhanced relighting with GGX BRDF, hemisphere lighting, and wrap lighting.
+        Fixes dark spot artifacts and provides physically-based rendering quality.
+        
+        New parameters:
+        - roughness: Surface roughness for GGX BRDF (0=smooth, 1=rough)
+        - sky_color: RGB tuple for hemisphere sky color (None = use ambient)
+        - ground_color: RGB tuple for hemisphere ground color (None = use ambient)
+        - wrap_lighting: Wrap lighting amount for two-sided mode (0-1)
+        - shadow_strength: Auto-shadowing strength (0-1)
+        """
+        eps = 1e-8
         normals = data['normals']
         colors_sh = data['colors_sh']
         labels = data.get('labels', None)
+        positions = data.get('positions', None)
         
         # Calculate Sun Direction
         sun_dir = LightForgeEngine.spherical_to_cartesian(azimuth, elevation)
         
-        # Calculate Lighting Factor (Lambertian)
+        # === ROBUST NORMAL VALIDATION ===
         norm_lengths = np.linalg.norm(normals, axis=1, keepdims=True)
-        norm_lengths = np.where(norm_lengths < 1e-6, 1.0, norm_lengths)
+        norm_lengths = np.where(norm_lengths < eps, 1.0, norm_lengths)
         normals_norm = normals / norm_lengths
         
-        dot = np.dot(normals_norm, sun_dir)
-        diffuse = np.maximum(0, dot)
-        lighting_factor = ambient + (1.0 - ambient) * intensity * diffuse
-        lighting_factor = np.clip(lighting_factor, 0, 2.0).reshape(-1, 1)
+        # Detect invalid normals
+        invalid_mask = (norm_lengths.squeeze() < 0.5) | np.isnan(normals_norm).any(axis=1)
+        if invalid_mask.any():
+            print(f"⚠️  Found {invalid_mask.sum()} invalid normals during relighting, using up vector")
+            normals_norm[invalid_mask] = np.array([0.0, 1.0, 0.0])
         
-        # Create final lighting mask
-        # Default: Apply to all (1.0)
-        # If masking: Apply 1.0 to masked, and maybe neutral (1.0 for ambient?) to others? 
-        # Or just don't change the others?
-        # The equation above calculates a modification factor.
-        # If we don't want to relight, the factor should be 1.0? 
-        # No, the previous code replaces color. 
-        # So we should calculate NEW colors for ALL, then blend based on mask.
+        # --- DIFFUSE (Lambertian with optional wrap) ---
+        dot = np.dot(normals_norm, sun_dir)
+        
+        if two_sided:
+            if wrap_lighting > 0.01:
+                # Wrap lighting: smoother transition around edges
+                diffuse = ((dot + wrap_lighting) / (1.0 + wrap_lighting))
+                diffuse = np.maximum(0, diffuse)
+            else:
+                # Traditional two-sided with MINIMUM to prevent dark spots
+                # Instead of 0.5 + 0.5 * dot (range 0-1), use 0.6 + 0.4 * dot (range 0.2-1.0)
+                # This ensures even back-facing normals get at least 20% lighting
+                diffuse = 0.6 + 0.4 * dot
+        else:
+            # Traditional one-sided lighting
+            diffuse = np.maximum(0, dot)
+        
+        # --- SPECULAR (GGX or Blinn-Phong) ---
+        view_dir = np.array([0.0, 0.0, 1.0])
+        
+        if specular_strength > 0.01:
+            if roughness < 0.99:  # Use GGX for realistic materials
+                specular = LightForgeEngine._ggx_specular(
+                    normals_norm, sun_dir, view_dir, roughness, specular_strength
+                )
+            else:  # Fall back to Blinn-Phong for very rough surfaces
+                half_vector = (sun_dir + view_dir)
+                half_vector = half_vector / (np.linalg.norm(half_vector) + eps)
+                spec_angle = np.dot(normals_norm, half_vector)
+                specular = np.power(np.maximum(0, spec_angle), shininess) * specular_strength
+        else:
+            specular = np.zeros(len(normals_norm))
+        
+        # --- HEMISPHERE LIGHTING (GI Approximation) ---
+        hemisphere_contribution = np.zeros((len(normals_norm), 3))
+        
+        if sky_color is not None or ground_color is not None:
+            # Default colors if not provided
+            if sky_color is None:
+                sky_color = np.array([0.53, 0.81, 0.92])  # Light blue sky
+            if ground_color is None:
+                ground_color = np.array([0.24, 0.15, 0.09])  # Dark brown ground
+            
+            # Blend between sky and ground based on normal Y component
+            normal_y = normals_norm[:, 1]  # Y component (-1 to 1)
+            sky_factor = (normal_y + 1.0) * 0.5  # Convert to (0 to 1)
+            sky_factor = np.clip(sky_factor, 0, 1).reshape(-1, 1)
+            
+            hemisphere_contribution = (sky_factor * sky_color + (1.0 - sky_factor) * ground_color) * ambient
+        
+        # --- AUTO-SHADOWING (Heuristic) ---
+        shadow_factor = 1.0
+        if shadow_strength > 0.01:
+            # Areas facing away from light get more shadow
+            shadow_from_orientation = np.clip(1.0 - dot, 0, 1)
+            
+            # Optional: Add height-based shadowing if positions available
+            if positions is not None:
+                # Normalize Y position to 0-1 range
+                y_positions = positions[:, 1]
+                y_min, y_max = y_positions.min(), y_positions.max()
+                if y_max > y_min:
+                    y_normalized = (y_positions - y_min) / (y_max - y_min + eps)
+                    shadow_from_height = 1.0 - y_normalized * 0.3  # Lower areas get 30% more shadow
+                else:
+                    shadow_from_height = 1.0
+            else:
+                shadow_from_height = 1.0
+            
+            shadow_factor = 1.0 - (shadow_from_orientation * shadow_strength * 0.5 * shadow_from_height)
+            shadow_factor = np.clip(shadow_factor, 0.1, 1.0)  # Never completely black
+        
+        # --- COMBINE LIGHTING ---
+        # Minimum lighting floor to prevent completely black regions
+        # Increased from 0.15 to 0.3 for more aggressive dark spot prevention
+        min_lighting = max(ambient * 0.3, 0.15)  # At least 30% of ambient, minimum 0.15
+        
+        # Direct lighting (ambient + diffuse)
+        direct_lighting = ambient + (1.0 - ambient) * intensity * diffuse * shadow_factor
+        direct_lighting = np.clip(direct_lighting, min_lighting, 5.0).reshape(-1, 1)
+        
+        # Specular component
+        specular_component = specular.reshape(-1, 1) * intensity
         
         # Convert SH to RGB
         rgb = LightForgeEngine.sh_to_rgb(colors_sh)
         
-        # Modulate RGB
-        rgb_lit = rgb * lighting_factor
+        # Combine: (Base * Direct) + Specular + Hemisphere
+        if hemisphere_contribution.any():
+            rgb_lit = (rgb * direct_lighting) + specular_component + hemisphere_contribution
+        else:
+            rgb_lit = (rgb * direct_lighting) + specular_component
         
-        # Apply Temperature
+        # --- TEMPERATURE (Color Tint) ---
         if abs(temp) > 0.01:
             if temp > 0:  # Warm
                 rgb_lit[:, 0] *= (1 + temp * 0.2)
@@ -258,43 +435,34 @@ class LightForgeEngine:
                 rgb_lit[:, 1] *= (1 + temp * 0.1)
                 rgb_lit[:, 2] *= (1 - temp * 0.2)
         
-        # Helper to convert Normals to RGB (0..1)
+        # --- VIEW MODES ---
         if view_mode == "Normals":
-            # Map [-1, 1] -> [0, 1]
             rgb_vis = (normals_norm + 1.0) * 0.5
             new_sh_all = LightForgeEngine.rgb_to_sh(rgb_vis)
         
         elif view_mode == "Light Map":
-            # Visualize lighting factor as grayscale
-            # Normalize factor for visualization (approx)
-            fact_vis = lighting_factor / max(intensity + 0.001, 1.0) 
+            fact_vis = direct_lighting / max(intensity + 0.001, 1.0) 
             fact_vis = np.clip(fact_vis, 0, 1)
             rgb_vis = np.hstack([fact_vis, fact_vis, fact_vis])
             new_sh_all = LightForgeEngine.rgb_to_sh(rgb_vis)
-            
         else:
-            # Final Mode
+            # Final - clip to valid range
             rgb_lit = np.clip(rgb_lit, 0, 1)
             new_sh_all = LightForgeEngine.rgb_to_sh(rgb_lit)
         
-        # Apply Masking
+        # --- CLUSTER MASKING ---
         if cluster_mask >= 0 and labels is not None:
-            print(f"Applying relighting ONLY to Cluster {cluster_mask}")
-            # Create boolean mask
-            mask = (labels == cluster_mask)
-            # Expand mask for SH dims if needed, or index
-            # colors_sh is [N, 3]
-            # new_sh_all is [N, 3]
-            
-            final_sh = colors_sh.copy()
-            final_sh[mask] = new_sh_all[mask]
+             print(f"Applying relighting ONLY to Cluster {cluster_mask}")
+             mask = (labels == cluster_mask)
+             final_sh = colors_sh.copy()
+             final_sh[mask] = new_sh_all[mask]
         else:
-            final_sh = new_sh_all
+             final_sh = new_sh_all
             
-        # Update data copy
         new_data = data.copy()
         new_data['colors_sh'] = final_sh
         return new_data
+
 
     @staticmethod
     def save_ply(data, output_path):
@@ -304,69 +472,56 @@ class LightForgeEngine:
         original_vertex_data = data['vertex_data']
         new_sh = data['colors_sh']
         
-        # Update vertex data
-        # We need to copy to avoid modifying original if it's shared? 
-        # But here we assume we are saving the 'data' object which is already modified or holder of modified data.
-        # Actually vertex_data is a numpy structured array. We need to write into it.
-        
         params_vertex_data = original_vertex_data.copy()
-        
         params_vertex_data['f_dc_0'] = new_sh[:, 0]
         params_vertex_data['f_dc_1'] = new_sh[:, 1]
         params_vertex_data['f_dc_2'] = new_sh[:, 2]
-        
-        # Note: We are currently NOT saving computed normals back to file to keep file size same as original 
-        # unless we explicitly want to add them. 
-        # If the original didn't have normals, this saves without them (unless we add fields).
-        # For safety/compatibility, let's just update colors.
         
         vertex_element = PlyElement.describe(params_vertex_data, 'vertex')
         PlyData([vertex_element], text=False).write(output_path)
         return output_path
 
     @staticmethod
-    def generate_preview(azimuth, elevation, intensity, ambient, temperature, size=512):
+    def generate_preview(azimuth, elevation, intensity, ambient, temperature, specular_strength=0.0, shininess=30.0, size=512):
         """
-        Generates a preview image of a sphere with the applied lighting.
-        Returns a numpy array (H, W, 3) normalized 0-1.
+        Generates a preview image of a sphere with the applied lighting (PBR).
         """
-        # Create a grid
         x = np.linspace(-1, 1, size)
-        y = np.linspace(1, -1, size) # Flip Y to match image coords top-down
+        y = np.linspace(1, -1, size)
         xv, yv = np.meshgrid(x, y)
-        
-        # Define sphere mask: r^2 = x^2 + y^2
         r2 = xv**2 + yv**2
         mask = r2 <= 1.0
         
-        # Calculate normals for the sphere: z = sqrt(1 - r^2)
         z = np.zeros_like(xv)
         z[mask] = np.sqrt(1.0 - r2[mask])
         
-        # Normals grid: (Size, Size, 3)
         normals = np.zeros((size, size, 3))
         normals[:, :, 0] = xv
         normals[:, :, 1] = yv
         normals[:, :, 2] = z
         
-        # Light Direction
         sun_dir = LightForgeEngine.spherical_to_cartesian(azimuth, elevation)
         
-        # Flatten for calculation
         n_flat = normals.reshape(-1, 3)
         
-        # Compute Dot Product
+        # Diffuse
         dot = np.dot(n_flat, sun_dir)
         diffuse = np.maximum(0, dot)
-        
-        # Calculate Lighting Factor
         lighting_factor = ambient + (1.0 - ambient) * intensity * diffuse
+        
+        # Specular
+        view_dir = np.array([0.0, 0.0, 1.0])
+        half_vector = (sun_dir + view_dir) / np.linalg.norm(sun_dir + view_dir)
+        spec_angle = np.dot(n_flat, half_vector)
+        specular = np.power(np.maximum(0, spec_angle), shininess) * specular_strength * intensity
+        
         lighting_factor = lighting_factor.reshape(size, size, 1)
+        specular = specular.reshape(size, size, 1)
         
-        # Base Color (White Sphere)
-        rgb = np.ones((size, size, 3)) * lighting_factor
+        # Combine
+        rgb = (np.ones((size, size, 3)) * lighting_factor) + specular
         
-        # Apply Temperature (shared logic)
+        # Temperature
         if abs(temperature) > 0.01:
             if temperature > 0:  # Warm
                 rgb[:, :, 0] *= (1 + temperature * 0.2)
@@ -377,10 +532,7 @@ class LightForgeEngine:
                 rgb[:, :, 1] *= (1 + temperature * 0.1)
                 rgb[:, :, 2] *= (1 - temperature * 0.2)
                 
-        # Mask background to black
         rgb[~mask] = 0.0
-        
-        # Clip to valid range
         rgb = np.clip(rgb, 0, 1)
         
         return rgb
